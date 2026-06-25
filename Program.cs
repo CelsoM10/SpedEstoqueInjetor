@@ -32,18 +32,15 @@ if (!Directory.Exists(PASTA_TRABALHO))
 }
 Console.WriteLine($"Pasta de trabalho : {PASTA_TRABALHO}\n");
 
-// ── 2. Localizar planilha Excel ────────────────────────────────────────────
+// ── 2. Localizar planilha Excel (Automático) ───────────────────────────────
 string[] excels = Directory.GetFiles(PASTA_TRABALHO, "*.xlsx");
 if (excels.Length == 0)
     Erro("Nenhuma planilha .xlsx encontrada na pasta de trabalho.");
 
-string xlsxPath = excels.Length == 1
-    ? excels[0]
-    : EscolherArquivo("Escolha a planilha Excel:", excels);
-
+string xlsxPath = excels[0];
 Console.WriteLine($"Planilha          : {Path.GetFileName(xlsxPath)}");
 
-// ── 3. Localizar arquivo SPED ──────────────────────────────────────────────
+// ── 3. Localizar arquivo SPED (Automático) ─────────────────────────────────
 string[] speds = Directory.GetFiles(PASTA_TRABALHO, "*.txt")
     .Where(f => !Path.GetFileNameWithoutExtension(f).EndsWith(SUFIXO_SAIDA))
     .ToArray();
@@ -51,9 +48,7 @@ string[] speds = Directory.GetFiles(PASTA_TRABALHO, "*.txt")
 if (speds.Length == 0)
     Erro("Nenhum arquivo SPED .txt encontrado na pasta de trabalho.");
 
-string spedEntrada = speds.Length == 1
-    ? speds[0]
-    : EscolherArquivo("Escolha o arquivo SPED:", speds);
+string spedEntrada = speds[0];
 
 string spedSaida = Path.Combine(
     PASTA_TRABALHO,
@@ -67,8 +62,8 @@ Console.WriteLine();
 Console.WriteLine("Lendo planilha...");
 var itens = LerItens(xlsxPath);
 var estoques = LerEstoques(xlsxPath);
-Console.WriteLine($"  {itens.Count} produto(s) unico(s) encontrado(s)");
-Console.WriteLine($"  {estoques.Count} linha(s) de estoque encontrada(s)");
+Console.WriteLine($"  {itens.Count} produto(s) unico(s) encontrado(s) na planilha");
+Console.WriteLine($"  {estoques.Count} linha(s) de estoque encontrada(s) na planilha");
 
 Console.WriteLine("Lendo SPED e limpando assinaturas antigas...");
 var linhasSped = new List<string>();
@@ -104,7 +99,7 @@ using (var reader = new StreamReader(spedEntrada, encodingSped))
 }
 Console.WriteLine($"  {linhasSped.Count} linha(s) válidas carregadas.");
 
-Console.WriteLine("Injetando 0200 e K200...");
+Console.WriteLine("Injetando 0200 e K200 com Inteligência de Merge...");
 var resultado = InjetarRegistros(linhasSped, itens, estoques, CODIGO_UNID_PC);
 
 Console.WriteLine("Recalculando contadores...");
@@ -174,7 +169,7 @@ static List<(string Cod, decimal Qtd, int IndEst, string Cnpj)>
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  INJEÇÃO NO SPED
+//  INJEÇÃO NO SPED (Com Consolidação Dinâmica do Registro 0200)
 // ════════════════════════════════════════════════════════════════════════════
 
 static List<string> InjetarRegistros(
@@ -184,6 +179,9 @@ static List<string> InjetarRegistros(
     string codUnidPc)
 {
     string dataFinal = DataFinalPeriodo(linhas);
+
+    // Função interna para padronizar o código do item (Trava anti-duplicidade)
+    string ChaveLimpa(string codigo) => codigo.Trim().TrimStart('0');
 
     // Unidades já cadastradas no 0190
     var unidsCadastradas = linhas
@@ -210,10 +208,35 @@ static List<string> InjetarRegistros(
         .Select(u => $"|0190|{codUnidPc}|{u}|")
         .ToList();
 
-    // Registros 0200
-    // Registros 0200 corrigidos para conter exatamente 13 campos (14 pipes no total)
-    var novos0200 = itens
-        .Select(i => $"|0200|{i.Cod}|{i.Descr}|||{i.Unid}|{i.Tipo}|{i.Ncm}||||||")
+    // ── MERGE DOS REGISTROS 0200 (Com trava de duplicidade) ─────────────────
+    var dicionario0200 = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    // 1. Carrega todos os registros 0200 originais usando a ChaveLimpa
+    foreach (var linha in linhas)
+    {
+        if (linha.StartsWith("|0200|"))
+        {
+            var campos = linha.Split('|');
+            if (campos.Length > 2)
+            {
+                string chaveOriginal = ChaveLimpa(campos[2]);
+                dicionario0200[chaveOriginal] = linha;
+            }
+        }
+    }
+
+    // 2. Mescla com os itens do Excel (se a ChaveLimpa bater, ele substitui o antigo e evita duplicar)
+    foreach (var i in itens)
+    {
+        string chaveExcel = ChaveLimpa(i.Cod);
+        string linha0200Formatada = $"|0200|{i.Cod}|{i.Descr}|||{i.Unid}|{i.Tipo}|{i.Ncm}||||||";
+        dicionario0200[chaveExcel] = linha0200Formatada;
+    }
+
+    // Ordena o Bloco 0200 final
+    var listaFinal0200 = dicionario0200
+        .OrderBy(kv => kv.Key)
+        .Select(kv => kv.Value)
         .ToList();
 
     // Registros K200
@@ -229,8 +252,8 @@ static List<string> InjetarRegistros(
         return $"|K200|{dataFinal}|{e.Cod}|{qtdFmt}|{e.IndEst}|{codPart}|";
     }).ToList();
 
-    // ── Montar resultado ───────────────────────────────────────────────────
-    var res = new List<string>(linhas.Count + novos0200.Count + novosK200.Count + 20);
+    // ── Montar resultado final ─────────────────────────────────────────────
+    var res = new List<string>(linhas.Count + listaFinal0200.Count + novosK200.Count + 20);
     bool inseriu0190 = novas0190.Count == 0;
     bool inseriu0200 = false;
     bool inseriuK200 = false;
@@ -239,27 +262,22 @@ static List<string> InjetarRegistros(
     {
         string reg = Reg(linha);
 
-        // Adicionar novas unidades 0190 antes do primeiro 0200
         if (!inseriu0190 && reg == "0200")
         {
             foreach (var n in novas0190) res.Add(n);
             inseriu0190 = true;
         }
 
-        // Pular 0200 antigos
         if (reg == "0200") continue;
 
-        // Inserir novos 0200 quando bloco 0200 terminar (chega no 0400 ou 0990)
         if (!inseriu0200 && (reg == "0400" || reg == "0990"))
         {
-            foreach (var n in novos0200) res.Add(n);
+            foreach (var n in listaFinal0200) res.Add(n);
             inseriu0200 = true;
         }
 
-        // Pular K200 antigos
         if (reg == "K200") continue;
 
-        // Se encontrar abertura de bloco K vazia (K001 com '1'), altera para '0' (com dados)
         if (reg == "K001")
         {
             var camposK = linha.Split('|');
@@ -271,7 +289,6 @@ static List<string> InjetarRegistros(
             }
         }
 
-        // Inserir novos K200 antes do K990
         if (!inseriuK200 && reg == "K990")
         {
             foreach (var n in novosK200) res.Add(n);
@@ -281,14 +298,11 @@ static List<string> InjetarRegistros(
         res.Add(linha);
     }
 
-    // Segurança: pontos de inserção não encontrados
-    if (!inseriu0200) InserirAntes(res, "0990", novos0200);
+    if (!inseriu0200) InserirAntes(res, "0990", listaFinal0200);
     if (!inseriuK200) InserirAntes(res, "K990", novosK200);
 
-    Console.WriteLine($"  {novos0200.Count} registro(s) 0200 injetado(s)");
+    Console.WriteLine($"  {dicionario0200.Count} registro(s) 0200 consolidados no total (Trava anti-duplicidade aplicada)");
     Console.WriteLine($"  {novosK200.Count} registro(s) K200 injetado(s)");
-    if (novas0190.Count > 0)
-        Console.WriteLine($"  {novas0190.Count} unidade(s) nova(s) adicionada(s) ao 0190");
 
     return res;
 }
@@ -351,12 +365,11 @@ static List<string> ReconstruirBloco9(List<string> linhas)
     var bloco9 = new List<string> { "|9001|0|" };
     bloco9.AddRange(linhas9900);
 
-    // Regra do PVA: O 9990 conta TODAS as linhas do bloco 9, INCLUINDO a própria linha do 9990.
-    // Como a lista 'bloco9' atual tem (9001 + as linhas 9900), somamos +1 que representa a linha do 9990 que estamos inserindo agora.
+    // Contagem exata e dinâmica do tamanho do Bloco 9 para o 9990
     int qtd9990 = bloco9.Count + 2;
     bloco9.Add($"|9990|{qtd9990}|");
 
-    // Total geral do arquivo (linhas dos outros blocos + linhas do bloco 9 + a própria linha do 9999)
+    // Totalização matemática definitiva do arquivo para o 9999
     int qtd9999 = sem9.Count + bloco9.Count + 1;
     bloco9.Add($"|9999|{qtd9999}|");
 
@@ -405,16 +418,6 @@ static void InserirAntes(List<string> linhas, string reg, List<string> novas)
     int idx = linhas.FindIndex(l => Reg(l) == reg);
     if (idx >= 0) linhas.InsertRange(idx, novas);
     else linhas.AddRange(novas);
-}
-
-static string EscolherArquivo(string titulo, string[] arquivos)
-{
-    Console.WriteLine(titulo);
-    for (int i = 0; i < arquivos.Length; i++)
-        Console.WriteLine($"  [{i + 1}] {Path.GetFileName(arquivos[i])}");
-    Console.Write("Digite o numero: ");
-    int escolha = int.Parse(Console.ReadLine() ?? "1") - 1;
-    return arquivos[Math.Clamp(escolha, 0, arquivos.Length - 1)];
 }
 
 static void Erro(string msg)
