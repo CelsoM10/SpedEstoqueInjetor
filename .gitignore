@@ -480,5 +480,7 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
-. v s /  
- 
+. v s / 
+
+# Pasta de trabalho com dados fiscais de clientes (nao versionar)
+Trabalho/
